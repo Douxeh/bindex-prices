@@ -41,6 +41,7 @@ const GAMES = [
     standardVariants: ['normal', 'holofoil', 'unlimitedHolofoil', 'unlimited', '1stEditionHolofoil', 'firstEditionHolofoil'],
     secondVariant: 'reverseHolofoil', secondSuffix: '-holo',
     includeExpansion: (e) => !e.is_online_only,
+    sealed: true,
   },
   {
     id: 'onepiece', name: 'One Piece', scrydex: 'onepiece', cardmarketGame: 18,
@@ -50,6 +51,7 @@ const GAMES = [
     // Cardmarket names One Piece singles "Name (OP01-003)": match on that code,
     // one product per printing (normal, alt art, manga…).
     matchByCode: true,
+    sealed: true,
   },
   {
     id: 'mtg', name: 'Magic: The Gathering', scrydex: 'magicthegathering', cardmarketGame: 1,
@@ -60,6 +62,25 @@ const GAMES = [
       && !['memorabilia', 'alchemy', 'token', 'minigame'].includes(e.type),
     // ~105k cards: refresh sets released in the last 120 days daily, the rest weekly.
     rotation: { shards: 7, recentDays: 120 },
+  },
+  {
+    id: 'lorcana', name: 'Disney Lorcana', scrydex: 'lorcana', cardmarketGame: 19,
+    standardVariants: ['normal'],
+    secondVariant: 'foil', secondSuffix: '-foil',
+    includeExpansion: () => true,
+  },
+  {
+    id: 'gundam', name: 'Gundam', scrydex: 'gundam', cardmarketGame: 24,
+    standardVariants: ['normal'],
+    secondVariant: null, secondSuffix: null,
+    includeExpansion: () => true,
+  },
+  {
+    id: 'riftbound', name: 'Riftbound', scrydex: 'riftbound', cardmarketGame: 22,
+    standardVariants: ['normal'],
+    secondVariant: 'foil', secondSuffix: '-foil',
+    includeExpansion: () => true,
+    sealed: true,
   },
 ];
 
@@ -154,6 +175,15 @@ function scrydexClient(game) {
         if (all.length >= (body.total_count ?? 0) || body.data.length === 0) break;
       }
       return all.filter(game.includeExpansion);
+    },
+    async sealed() {
+      const all = [];
+      for (let page = 1; ; page++) {
+        const body = await get(`/sealed?page_size=100&page=${page}&include=prices`);
+        all.push(...body.data);
+        if (all.length >= (body.total_count ?? 0) || body.data.length === 0) break;
+      }
+      return all;
     },
     async cards(setId) {
       const cards = [];
@@ -435,6 +465,76 @@ function updateHistory(prev, cards) {
   return { updatedAt: today, points };
 }
 
+// ---------- Sealed products ----------
+
+const normalizeSealed = (name) => name
+  .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+  .toLowerCase()
+  .replace(/\(.*?\)/g, ' ')
+  .replace(/pokemon tcg:|pokemon card|pokemon|one piece card game|tcg/g, ' ')
+  .replace(/\bbooster pack\b/g, 'booster')
+  .replace(/[^a-z0-9 ]/g, ' ')
+  .replace(/\s+/g, ' ')
+  .trim();
+
+async function buildSealed(game, client, dir, setNames) {
+  const [raw, cmProducts, cmGuide] = await Promise.all([
+    client.sealed(),
+    fetchJSON(`https://downloads.s3.cardmarket.com/productCatalog/productList/products_nonsingles_${game.cardmarketGame}.json`).catch(() => ({ products: [] })),
+    fetchJSON(`https://downloads.s3.cardmarket.com/productCatalog/priceGuide/price_guide_${game.cardmarketGame}.json`).catch(() => ({ priceGuides: [] })),
+  ]);
+  const prices = new Map(cmGuide.priceGuides.map((g) => [g.idProduct, g]));
+  const byName = new Map();
+  for (const product of cmProducts.products || []) {
+    const guide = prices.get(product.idProduct);
+    if (!guide?.trend) continue;
+    const key = normalizeSealed(product.name);
+    if (!byName.has(key)) byName.set(key, []);
+    byName.get(key).push({ ...product, guide });
+  }
+
+  let matched = 0;
+  const products = raw.map((item) => {
+    const variant = (item.variants || []).find((v) => (v.prices || []).some((p) => p.type === 'raw' && p.market != null)) || item.variants?.[0];
+    const price = (variant?.prices || []).find((p) => p.type === 'raw' && p.currency === 'USD' && p.market != null);
+    const image = (variant?.images || item.images || []).find((i) => i.type === 'front') || variant?.images?.[0] || item.images?.[0];
+    const usd = round(price?.market);
+    // Same name on Cardmarket; when several, the one whose price best tracks the US one.
+    let cm = null;
+    const candidates = byName.get(normalizeSealed(item.name)) || [];
+    if (candidates.length === 1) cm = candidates[0];
+    else if (candidates.length > 1 && usd) {
+      cm = candidates.reduce((best, c) => {
+        const error = Math.abs(Math.log(c.guide.trend / usd));
+        return !best || error < best.error ? { ...c, error } : best;
+      }, null);
+    }
+    if (cm && usd && (cm.guide.trend / usd < 0.25 || cm.guide.trend / usd > 4)) cm = null;
+    if (cm) matched++;
+    const tcgplayer = (variant?.marketplaces || []).find((m) => m.name === 'tcgplayer');
+    return {
+      id: item.id,
+      name: item.name,
+      type: item.type ?? null,
+      setId: item.expansion?.id ?? null,
+      setName: item.expansion?.name ?? setNames.get(item.expansion?.id) ?? null,
+      releaseDate: item.release_date ?? null,
+      imageSmall: image?.small ?? null,
+      imageLarge: image?.large ?? null,
+      variant: variant?.name ?? null,
+      usd,
+      change: price?.trends ? Object.fromEntries([7, 30, 90].map((d) => [`d${d}`, round(price.trends[`days_${d}`]?.percent_change)]).filter(([, v]) => v != null)) : null,
+      eur: cm ? eurFrom(cm.guide) : null,
+      cardmarketId: cm?.idProduct ?? null,
+      tcgplayerId: tcgplayer?.product_id ?? null,
+    };
+  }).filter((p) => p.usd != null || p.eur != null)
+    .sort((a, b) => (b.releaseDate || '').localeCompare(a.releaseDate || '') || (b.usd || 0) - (a.usd || 0));
+
+  await writeFile(join(dir, 'sealed.json'), JSON.stringify({ updatedAt: today, products }));
+  return { sealed: products.length, sealedWithCardmarket: matched };
+}
+
 // ---------- Build one game ----------
 
 function isDueToday(game, expansion) {
@@ -467,7 +567,8 @@ async function buildGame(game) {
   let totalCards = 0;
 
   // Oldest first so reprint sets claim their own Cardmarket expansion.
-  const ordered = [...expansions].sort((a, b) => (a.release_date || '').localeCompare(b.release_date || ''));
+  // ONLY_SEALED=1 (local testing): skip the card sets, build sealed products only.
+  const ordered = process.env.ONLY_SEALED ? [] : [...expansions].sort((a, b) => (a.release_date || '').localeCompare(b.release_date || ''));
   await mapLimit(ordered, 3, async (expansion) => {
     const set = {
       id: expansion.id,
@@ -518,11 +619,21 @@ async function buildGame(game) {
 
   summaries.sort((a, b) => (b.releaseDate || '').localeCompare(a.releaseDate || ''));
   await writeFile(join(dir, 'sets.json'), JSON.stringify({ updatedAt: today, sets: summaries }));
+
+  let sealedInfo = {};
+  if (game.sealed && !ONLY_SETS.length) {
+    try {
+      sealedInfo = await buildSealed(game, client, dir, new Map(summaries.map((s) => [s.id, s.name])));
+    } catch (error) {
+      console.warn(`  sealed failed for ${game.id}: ${error.message}`);
+    }
+  }
   await writeFile(join(dir, 'search.json'), JSON.stringify({ updatedAt: today, cards: search }));
   const info = {
     id: game.id, name: game.name, sets: summaries.length, cards: totalCards,
     cardsWithCardmarket: matchedCards, refreshedSets: refreshed, carriedSets: carried,
     cardmarketGuideCreatedAt: cm.createdAt, seconds: Math.round((Date.now() - started) / 1000),
+    ...sealedInfo,
   };
   console.log(' ', info);
   return info;

@@ -26,7 +26,10 @@ on Cardmarket.
 | `v1/<game>/history/<setId>.json` | Daily `[date, usd, eur, estimated?]` points per `cardId\|variant` (400 days) |
 | `v1/<game>/search.json` | `[id, name, number, setId, rarity, image]` for every card |
 
-`<game>` is `pokemon`, `onepiece` or `mtg`. Magic (~105k cards) refreshes sets
+`<game>` is `pokemon`, `onepiece`, `mtg`, `lorcana`, `gundam` or `riftbound`.
+`v1/<game>/sealed.json` lists sealed products (booster boxes, ETBs, packs,
+tins…) for Pokémon, One Piece and Riftbound: Scrydex USD price + image, and
+the Cardmarket EUR price when the product name matches. Magic (~105k cards) refreshes sets
 from the last 120 days daily and older sets once a week (7 rotating shards);
 other files carry over from the previous deploy. One Piece is matched to
 Cardmarket by card code (e.g. `OP01-003`).
