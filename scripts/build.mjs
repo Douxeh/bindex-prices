@@ -26,6 +26,7 @@
 //      ONLY_GAMES / ONLY_SETS (comma lists, for local runs)
 
 import { mkdir, writeFile } from 'node:fs/promises';
+import { collectCards, collectSealed, buildInsights } from './insights.mjs';
 import { join } from 'node:path';
 
 const OUT = process.env.OUT_DIR || 'public';
@@ -101,7 +102,7 @@ const GAMES = [
 
 const key = process.env.SCRYDEX_API_KEY;
 const team = process.env.SCRYDEX_TEAM_ID;
-const needsScrydex = GAMES.some((g) => g.source !== 'tcgcsv' && (!ONLY_GAMES.length || ONLY_GAMES.includes(g.id)));
+const needsScrydex = !process.env.INSIGHTS_ONLY && GAMES.some((g) => g.source !== 'tcgcsv' && (!ONLY_GAMES.length || ONLY_GAMES.includes(g.id)));
 if (needsScrydex && (!key || !team)) {
   console.error('Missing SCRYDEX_API_KEY / SCRYDEX_TEAM_ID');
   process.exit(1);
@@ -725,6 +726,7 @@ async function buildSealed(game, client, dir, setNames) {
     .sort((a, b) => (b.releaseDate || '').localeCompare(a.releaseDate || '') || (b.usd || 0) - (a.usd || 0));
 
   await writeFile(join(dir, 'sealed.json'), JSON.stringify({ updatedAt: today, products }));
+  collectSealed(game, products);
   return { sealed: products.length, sealedWithCardmarket: matched };
 }
 
@@ -805,6 +807,7 @@ async function buildGame(game) {
     }
     const cards = file.cards;
     if (cards.length === 0) return; // sealed-only groups
+    collectCards(game, set, cards);
     if (game.source === 'tcgcsv') file.set.total = file.set.printedTotal = cards.length;
     await writeFile(join(dir, 'sets', `${expansion.id}.json`), JSON.stringify(file));
 
@@ -839,7 +842,24 @@ async function buildGame(game) {
 
 // ---------- Main ----------
 
+/** INSIGHTS_ONLY=1 (local testing): rebuild only the market insights from the published feed. */
+async function insightsOnly() {
+  const rate = await usdToEur();
+  for (const game of GAMES) {
+    if (game.disabled || (ONLY_GAMES.length && !ONLY_GAMES.includes(game.id))) continue;
+    const index = await previous(`v1/${game.id}/sets.json`);
+    await mapLimit(index?.sets || [], 8, async (set) => {
+      const file = await previous(`v1/${game.id}/sets/${encodeURIComponent(set.id)}.json`);
+      if (file?.cards) collectCards(game, set, file.cards);
+    });
+    const sealedFile = await previous(`v1/${game.id}/sealed.json`);
+    if (sealedFile?.products) collectSealed(game, sealedFile.products);
+  }
+  console.log(await buildInsights({ out: OUT, today, usdToEur: rate, previous: await previous('v1/market/insights.json') }));
+}
+
 async function main() {
+  if (process.env.INSIGHTS_ONLY) return insightsOnly();
   const started = Date.now();
   const rate = await usdToEur();
   const games = [];
@@ -848,8 +868,18 @@ async function main() {
     if (game.disabled && !ONLY_GAMES.includes(game.id)) continue;
     games.push(await buildGame(game));
   }
+  let insights = null;
+  if (!ONLY_GAMES.length && !ONLY_SETS.length) {
+    try {
+      insights = await buildInsights({ out: OUT, today, usdToEur: rate, previous: await previous('v1/market/insights.json') });
+      console.log('  insights', insights);
+    } catch (error) {
+      console.warn(`  insights failed: ${error.message}`);
+    }
+  }
   const meta = {
     updatedAt: new Date().toISOString(),
+    insights,
     usdToEur: rate,
     games,
     scrydexCredits: creditsUsed,
