@@ -1,7 +1,7 @@
 # bindex-prices
 
-Daily price data for the Bindex iOS app, served from GitHub Pages:
-`https://douxeh.github.io/bindex-prices/v1/`.
+Daily price data for the Bindex iOS app (Pokémon, One Piece, Magic: The
+Gathering), served from GitHub Pages: `https://douxeh.github.io/bindex-prices/v1/`.
 
 Every night a GitHub Action (`.github/workflows/update-prices.yml`) runs
 `scripts/build.mjs`, which combines:
@@ -20,11 +20,16 @@ on Cardmarket.
 
 | Path | Contents |
 | --- | --- |
-| `v1/meta.json` | Run time, counts, Scrydex credits used |
-| `v1/sets.json` | All expansions with card count and set value |
-| `v1/sets/<setId>.json` | Every card with prices per variant |
-| `v1/history/<setId>.json` | Daily `[date, usd, eur, estimated?]` points per `cardId\|variant` (400 days) |
-| `v1/search.json` | `[id, name, number, setId, rarity, image]` for every card |
+| `v1/meta.json` | Run time, per-game counts, Scrydex credits used, ECB `usdToEur` rate |
+| `v1/<game>/sets.json` | All expansions with card count and set value |
+| `v1/<game>/sets/<setId>.json` | Every card with prices per variant (incl. graded) |
+| `v1/<game>/history/<setId>.json` | Daily `[date, usd, eur, estimated?]` points per `cardId\|variant` (400 days) |
+| `v1/<game>/search.json` | `[id, name, number, setId, rarity, image]` for every card |
+
+`<game>` is `pokemon`, `onepiece` or `mtg`. Magic (~105k cards) refreshes sets
+from the last 120 days daily and older sets once a week (7 rotating shards);
+other files carry over from the previous deploy. One Piece is matched to
+Cardmarket by card code (e.g. `OP01-003`).
 
 History is carried over from the previous deploy. The first points of a new
 series are seeded from the reported trends and flagged as estimated.

@@ -1,36 +1,67 @@
-// Daily Bindex price build.
+// Daily Bindex price build for several trading card games.
 //
 // Sources:
-//  - Scrydex (https://scrydex.com): every English Pokémon card with USD raw
-//    prices per variant/condition, graded prices and 1–180 day trends.
-//  - Cardmarket price guide (public daily download): EUR trend/avg/low per
-//    product, including the reverse-holo ("-holo") columns.
+//  - Scrydex (https://scrydex.com): every English card with USD raw prices
+//    per variant/condition, graded prices and 1–180 day trends.
+//  - Cardmarket price guides (public daily downloads): EUR trend/avg/low per
+//    product, including the reverse-holo / foil ("-holo"/"-foil") columns.
+//  - ECB reference rate: USD→EUR conversion for the app's currency switch.
 //
-// Cardmarket's guide has no card numbers, so each Cardmarket product is
+// Cardmarket's guides have no card numbers, so each Cardmarket product is
 // matched to a Scrydex card: expansion by card-name overlap, then within a
 // name group by price rank (falling back to release order).
 //
-// Output (written to ./public, served by GitHub Pages):
-//   v1/meta.json              run info
-//   v1/sets.json              all expansions
-//   v1/sets/<setId>.json      every card in the set with current prices
-//   v1/history/<setId>.json   daily price points per card+variant (rolling)
-//   v1/search.json            compact all-card index for global search
+// Output (./public, served by GitHub Pages):
+//   v1/meta.json                      run info, games, USD→EUR rate
+//   v1/<game>/sets.json               all expansions of a game
+//   v1/<game>/sets/<setId>.json       every card in the set with prices
+//   v1/<game>/history/<setId>.json    daily price points per card+variant
+//   v1/<game>/search.json             compact all-card index for search
 //
-// Env: SCRYDEX_API_KEY, SCRYDEX_TEAM_ID, PAGES_URL (previous deploy, for history)
+// Big catalogs (Magic) are refreshed in rotating shards: recent sets every
+// day, older sets once a week; the rest of the files carry over from the
+// previous deploy.
+//
+// Env: SCRYDEX_API_KEY, SCRYDEX_TEAM_ID, PAGES_URL (previous deploy),
+//      ONLY_GAMES / ONLY_SETS (comma lists, for local runs)
 
 import { mkdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
-const API = 'https://api.scrydex.com/pokemon/v1';
-const CM_GUIDE = 'https://downloads.s3.cardmarket.com/productCatalog/priceGuide/price_guide_6.json';
-const CM_PRODUCTS = 'https://downloads.s3.cardmarket.com/productCatalog/productList/products_singles_6.json';
 const OUT = process.env.OUT_DIR || 'public';
 const PAGES_URL = (process.env.PAGES_URL || '').replace(/\/$/, '');
 const HISTORY_DAYS = 400;
+const ONLY_GAMES = (process.env.ONLY_GAMES || '').split(',').filter(Boolean);
 const ONLY_SETS = (process.env.ONLY_SETS || '').split(',').filter(Boolean);
-const GRADED_COMPANIES = new Set(['PSA', 'BGS', 'CGC', 'SGC']);
-const STANDARD_VARIANTS = ['normal', 'holofoil', 'unlimitedHolofoil', 'unlimited', '1stEditionHolofoil', 'firstEditionHolofoil'];
+const GRADED_COMPANIES = new Set(['PSA', 'CGC', 'BGS', 'SGC', 'TAG', 'ACE', 'AGS']);
+
+const GAMES = [
+  {
+    id: 'pokemon', name: 'Pokémon', scrydex: 'pokemon', cardmarketGame: 6,
+    standardVariants: ['normal', 'holofoil', 'unlimitedHolofoil', 'unlimited', '1stEditionHolofoil', 'firstEditionHolofoil'],
+    secondVariant: 'reverseHolofoil', secondSuffix: '-holo',
+    includeExpansion: (e) => !e.is_online_only,
+  },
+  {
+    id: 'onepiece', name: 'One Piece', scrydex: 'onepiece', cardmarketGame: 18,
+    standardVariants: ['normal'],
+    secondVariant: null, secondSuffix: null,
+    includeExpansion: () => true,
+    // Cardmarket names One Piece singles "Name (OP01-003)": match on that code,
+    // one product per printing (normal, alt art, manga…).
+    matchByCode: true,
+  },
+  {
+    id: 'mtg', name: 'Magic: The Gathering', scrydex: 'magicthegathering', cardmarketGame: 1,
+    standardVariants: ['normal', 'nonfoil'],
+    secondVariant: 'foil', secondSuffix: '-foil',
+    expansionQuery: '',
+    includeExpansion: (e) => !e.is_online_only && !e.is_foreign_only
+      && !['memorabilia', 'alchemy', 'token', 'minigame'].includes(e.type),
+    // ~105k cards: refresh sets released in the last 120 days daily, the rest weekly.
+    rotation: { shards: 7, recentDays: 120 },
+  },
+];
 
 const key = process.env.SCRYDEX_API_KEY;
 const team = process.env.SCRYDEX_TEAM_ID;
@@ -41,6 +72,7 @@ if (!key || !team) {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const today = new Date().toISOString().slice(0, 10);
+const dayNumber = Math.floor(Date.now() / 86_400_000);
 let creditsUsed = 0;
 
 async function fetchJSON(url, { headers = {}, attempts = 5, allow404 = false } = {}) {
@@ -64,11 +96,6 @@ async function fetchJSON(url, { headers = {}, attempts = 5, allow404 = false } =
   throw new Error(`Gave up on ${url}`);
 }
 
-const scrydex = (path) => {
-  creditsUsed++;
-  return fetchJSON(`${API}${path}`, { headers: { 'X-Api-Key': key, 'X-Team-ID': team } });
-};
-
 async function mapLimit(items, limit, fn) {
   const results = new Array(items.length);
   let next = 0;
@@ -81,30 +108,65 @@ async function mapLimit(items, limit, fn) {
   return results;
 }
 
+const round = (n) => (n == null || Number.isNaN(n) ? null : Math.round(n * 100) / 100);
+
+function hashString(text) {
+  let h = 0;
+  for (const ch of text) h = (h * 31 + ch.charCodeAt(0)) | 0;
+  return Math.abs(h);
+}
+
+function daysAgo(n) {
+  const d = new Date();
+  d.setUTCDate(d.getUTCDate() - n);
+  return d.toISOString().slice(0, 10);
+}
+
+// ---------- FX ----------
+
+async function usdToEur() {
+  try {
+    const res = await fetch('https://www.ecb.europa.eu/stats/eurofxref/eurofxref-daily.xml');
+    const xml = await res.text();
+    const rate = Number(xml.match(/currency='USD' rate='([0-9.]+)'/)?.[1]);
+    return rate > 0 ? round4(1 / rate) : null;
+  } catch {
+    return null;
+  }
+}
+const round4 = (n) => Math.round(n * 10000) / 10000;
+
 // ---------- Scrydex ----------
 
-async function loadExpansions() {
-  const all = [];
-  for (let page = 1; ; page++) {
-    const body = await scrydex(`/expansions?page_size=100&page=${page}&q=language_code:EN`);
-    all.push(...body.data);
-    if (all.length >= (body.total_count ?? body.totalCount ?? 0) || body.data.length === 0) break;
-  }
-  return all.filter((e) => !e.is_online_only);
+function scrydexClient(game) {
+  const base = `https://api.scrydex.com/${game.scrydex}/v1`;
+  const get = (path) => {
+    creditsUsed++;
+    return fetchJSON(`${base}${path}`, { headers: { 'X-Api-Key': key, 'X-Team-ID': team } });
+  };
+  return {
+    async expansions() {
+      const all = [];
+      for (let page = 1; ; page++) {
+        const query = game.expansionQuery ?? 'q=language_code:EN';
+        const body = await get(`/expansions?page_size=100&page=${page}${query ? `&${query}` : ''}`);
+        all.push(...body.data);
+        if (all.length >= (body.total_count ?? 0) || body.data.length === 0) break;
+      }
+      return all.filter(game.includeExpansion);
+    },
+    async cards(setId) {
+      const cards = [];
+      const select = 'id,name,number,printed_number,rarity,supertype,type,images,variants';
+      for (let page = 1; ; page++) {
+        const body = await get(`/expansions/${encodeURIComponent(setId)}/cards?include=prices&page_size=100&page=${page}&select=${select}`);
+        cards.push(...body.data);
+        if (cards.length >= (body.total_count ?? 0) || body.data.length === 0) break;
+      }
+      return cards;
+    },
+  };
 }
-
-async function loadCards(setId) {
-  const cards = [];
-  const select = 'id,name,number,printed_number,rarity,supertype,images,variants';
-  for (let page = 1; ; page++) {
-    const body = await scrydex(`/expansions/${setId}/cards?include=prices&page_size=100&page=${page}&select=${select}`);
-    cards.push(...body.data);
-    if (cards.length >= (body.total_count ?? body.totalCount ?? 0) || body.data.length === 0) break;
-  }
-  return cards;
-}
-
-const round = (n) => (n == null || Number.isNaN(n) ? null : Math.round(n * 100) / 100);
 
 function compactVariant(variant) {
   const prices = variant.prices || [];
@@ -113,10 +175,10 @@ function compactVariant(variant) {
   const usd = nm ? {
     market: round(nm.market),
     low: round(nm.low),
-    // Price n days ago = market − change over n days.
     change: Object.fromEntries([1, 7, 14, 30, 90, 180]
       .map((d) => [`d${d}`, round(nm.trends?.[`days_${d}`]?.percent_change)])
       .filter(([, v]) => v != null)),
+    // Price n days ago = market − change over n days.
     past: Object.fromEntries([1, 7, 14, 30, 90, 180]
       .map((d) => [`d${d}`, change(d) != null && nm.market != null ? round(nm.market - change(d)) : null])
       .filter(([, v]) => v != null && v > 0)),
@@ -130,13 +192,7 @@ function compactVariant(variant) {
     .map((p) => ({ company: p.company, grade: p.grade, market: round(p.market), low: round(p.low), high: round(p.high) }))
     .sort((a, b) => a.company.localeCompare(b.company) || Number(b.grade) - Number(a.grade));
   const tcgplayer = (variant.marketplaces || []).find((m) => m.name === 'tcgplayer');
-  return {
-    name: variant.name,
-    usd,
-    conditions,
-    graded,
-    tcgplayerId: tcgplayer?.product_id ?? null,
-  };
+  return { name: variant.name, usd, conditions, graded, tcgplayerId: tcgplayer?.product_id ?? null };
 }
 
 function compactCard(card) {
@@ -145,9 +201,9 @@ function compactCard(card) {
     id: card.id,
     name: card.name,
     number: card.number,
-    printedNumber: card.printed_number,
-    rarity: card.rarity,
-    supertype: card.supertype,
+    printedNumber: card.printed_number ?? null,
+    rarity: card.rarity ?? null,
+    supertype: card.supertype ?? card.type ?? null,
     imageSmall: image?.small ?? null,
     imageLarge: image?.large ?? null,
     variants: (card.variants || []).map(compactVariant),
@@ -159,6 +215,7 @@ function compactCard(card) {
 const normalizeName = (name) => name
   .replace(/\[.*?\]/g, ' ')
   .replace(/\(.*?\)/g, ' ')
+  .split(' // ')[0]
   .normalize('NFD').replace(/[̀-ͯ]/g, '')
   .toLowerCase()
   .replace(/[’']/g, "'")
@@ -173,8 +230,12 @@ function naturalNumber(a, b) {
   return String(a).localeCompare(String(b));
 }
 
-async function loadCardmarket() {
-  const [guide, products] = await Promise.all([fetchJSON(CM_GUIDE), fetchJSON(CM_PRODUCTS)]);
+async function loadCardmarket(gameId) {
+  const base = 'https://downloads.s3.cardmarket.com/productCatalog';
+  const [guide, products] = await Promise.all([
+    fetchJSON(`${base}/priceGuide/price_guide_${gameId}.json`),
+    fetchJSON(`${base}/productList/products_singles_${gameId}.json`),
+  ]);
   const prices = new Map(guide.priceGuides.map((g) => [g.idProduct, g]));
   const byExpansion = new Map();
   for (const product of products.products) {
@@ -188,17 +249,81 @@ async function loadCardmarket() {
       expansionsByName.get(name).add(expansionId);
     }
   }
-  return { createdAt: guide.createdAt, prices, byExpansion, expansionsByName };
+  const byCode = new Map();
+  for (const product of products.products) {
+    const code = product.name.match(/\(([A-Z0-9]+-[A-Z0-9]+)\)\s*$/)?.[1];
+    if (!code) continue;
+    if (!byCode.has(code)) byCode.set(code, []);
+    byCode.get(code).push(product);
+  }
+  return { createdAt: guide.createdAt, prices, byExpansion, expansionsByName, byCode };
 }
 
-function primaryUsd(card) {
-  const variant = card.variants.find((v) => STANDARD_VARIANTS.includes(v.name) && v.usd?.market != null)
+const eurFrom = (g, suffix = '') => {
+  if (!g) return null;
+  const v = {
+    trend: round(g[`trend${suffix}`]), avg: round(g[`avg${suffix}`]), low: round(g[`low${suffix}`]),
+    avg1: round(g[`avg1${suffix}`]), avg7: round(g[`avg7${suffix}`]), avg30: round(g[`avg30${suffix}`]),
+  };
+  return Object.values(v).some((x) => x != null) ? v : null;
+};
+
+/**
+ * One Piece: every printing of a card code is its own Cardmarket product, and
+ * the same code exists in several Cardmarket expansions (English, Japanese,
+ * reprints). Pick the expansion whose prices track the US market best, then
+ * pair printings by price rank.
+ */
+function attachByCode(cards, cm) {
+  const median = (xs) => { const s = [...xs].sort((a, b) => a - b); return s.length ? s[Math.floor(s.length / 2)] : Infinity; };
+  const candidates = new Map();
+  for (const card of cards) {
+    for (const p of cm.byCode.get(card.id) || []) candidates.set(p.idExpansion, (candidates.get(p.idExpansion) || 0) + 1);
+  }
+  const top = [...candidates.entries()].sort((a, b) => b[1] - a[1]).slice(0, 4).map(([id]) => id);
+  let best = null;
+  for (const expansionId of top) {
+    const errors = [];
+    for (const card of cards) {
+      const usd = card.variants.find((v) => ['normal', 'foil'].includes(v.name))?.usd?.market;
+      const trends = (cm.byCode.get(card.id) || []).filter((p) => p.idExpansion === expansionId)
+        .map((p) => cm.prices.get(p.idProduct)?.trend).filter((t) => t > 0);
+      if (usd >= 0.5 && trends.length) errors.push(Math.abs(Math.log(Math.min(...trends) / usd)));
+    }
+    const coverage = cards.filter((c) => (cm.byCode.get(c.id) || []).some((p) => p.idExpansion === expansionId)).length / cards.length;
+    const score = median(errors) - coverage;
+    if (errors.length >= 3 && (!best || score < best.score)) best = { expansionId, score };
+  }
+  if (!best) return null;
+
+  for (const card of cards) {
+    const products = (cm.byCode.get(card.id) || [])
+      .filter((p) => p.idExpansion === best.expansionId)
+      .map((p) => ({ ...p, guide: cm.prices.get(p.idProduct) }))
+      .filter((p) => p.guide?.trend != null)
+      .sort((a, b) => a.guide.trend - b.guide.trend);
+    if (products.length === 0) continue;
+    const priced = card.variants.filter((v) => v.usd?.market != null).sort((a, b) => a.usd.market - b.usd.market);
+    card.cardmarketId = products[0].idProduct;
+    if (priced.length === products.length) {
+      priced.forEach((variant, i) => { variant.eur = eurFrom(products[i].guide); });
+    } else {
+      // Counts differ: only the cheapest printing (the regular one) is certain.
+      const base = card.variants.find((v) => ['normal', 'foil'].includes(v.name)) || priced[0];
+      if (base) base.eur = eurFrom(products[0].guide);
+    }
+  }
+  return best.expansionId;
+}
+
+function primaryUsd(card, game) {
+  const variant = card.variants.find((v) => game.standardVariants.includes(v.name) && v.usd?.market != null)
     || card.variants.find((v) => v.usd?.market != null);
   return variant?.usd?.market ?? null;
 }
 
 /** Returns Map(cardId -> Cardmarket product + price guide row). */
-function matchExpansion(cards, cm, claimed) {
+function matchExpansion(cards, cm, claimed, game) {
   const names = new Set(cards.map((c) => normalizeName(c.name)));
   const scores = new Map();
   for (const name of names) {
@@ -217,9 +342,8 @@ function matchExpansion(cards, cm, claimed) {
   const result = new Map();
   if (!best || best.score < 0.5) return { expansionId: null, matches: result };
 
-  const products = cm.byExpansion.get(best.expansionId);
   const productGroups = new Map();
-  for (const p of products) {
+  for (const p of cm.byExpansion.get(best.expansionId)) {
     if (!productGroups.has(p.base)) productGroups.set(p.base, []);
     productGroups.get(p.base).push(p);
   }
@@ -234,10 +358,10 @@ function matchExpansion(cards, cm, claimed) {
     if (!candidates || candidates.length !== group.length) continue;
     let orderedCards = [...group].sort((a, b) => naturalNumber(a.number, b.number));
     let orderedProducts = [...candidates].sort((a, b) => a.idProduct - b.idProduct);
-    const allPriced = group.every((c) => primaryUsd(c) != null)
+    const allPriced = group.every((c) => primaryUsd(c, game) != null)
       && candidates.every((p) => cm.prices.get(p.idProduct)?.trend != null);
     if (group.length > 1 && allPriced) {
-      orderedCards = [...group].sort((a, b) => primaryUsd(a) - primaryUsd(b));
+      orderedCards = [...group].sort((a, b) => primaryUsd(a, game) - primaryUsd(b, game));
       orderedProducts = [...candidates].sort((a, b) => cm.prices.get(a.idProduct).trend - cm.prices.get(b.idProduct).trend);
     }
     orderedCards.forEach((card, i) => {
@@ -248,47 +372,36 @@ function matchExpansion(cards, cm, claimed) {
   return { expansionId: best.expansionId, matches: result };
 }
 
-function attachCardmarket(card, match) {
+function attachCardmarket(card, match, game) {
   if (!match?.guide) return;
-  const g = match.guide;
-  const eur = (prefix = '') => {
-    const v = {
-      trend: round(g[`trend${prefix}`]), avg: round(g[`avg${prefix}`]), low: round(g[`low${prefix}`]),
-      avg1: round(g[`avg1${prefix}`]), avg7: round(g[`avg7${prefix}`]), avg30: round(g[`avg30${prefix}`]),
-    };
-    return Object.values(v).some((x) => x != null) ? v : null;
-  };
+  const eur = (suffix = '') => eurFrom(match.guide, suffix);
   card.cardmarketId = match.idProduct;
-  // Cardmarket's base columns are the standard print; "-holo" is the reverse
-  // holo. Stamped, cosmos, jumbo etc. are separate products there, so they
-  // get no EUR price rather than a wrong one.
-  const standard = card.variants.find((v) => STANDARD_VARIANTS.includes(v.name));
+  // The base columns are the standard print and the suffixed ones the reverse
+  // holo / foil. Stamped, cosmos, jumbo etc. are separate products there, so
+  // they get no EUR price rather than a wrong one.
+  const standard = card.variants.find((v) => game.standardVariants.includes(v.name));
   if (standard) standard.eur = eur();
-  const reverse = card.variants.find((v) => v.name === 'reverseHolofoil');
-  if (reverse) reverse.eur = eur('-holo');
+  if (game.secondVariant) {
+    const second = card.variants.find((v) => v.name === game.secondVariant);
+    if (second) second.eur = eur(game.secondSuffix);
+  }
   if (card.variants.length === 0) card.variants.push({ name: 'normal', usd: null, conditions: {}, graded: [], eur: eur() });
 }
 
 // ---------- History ----------
 
-async function previousHistory(setId) {
+async function previous(path) {
   if (!PAGES_URL) return null;
   try {
-    return await fetchJSON(`${PAGES_URL}/v1/history/${setId}.json`, { allow404: true, attempts: 2 });
+    return await fetchJSON(`${PAGES_URL}/${path}`, { allow404: true, attempts: 2 });
   } catch {
     return null;
   }
 }
 
-function daysAgo(n) {
-  const d = new Date();
-  d.setUTCDate(d.getUTCDate() - n);
-  return d.toISOString().slice(0, 10);
-}
-
 /** points[key] = [[date, usd, eur, estimated?], ...] */
-function updateHistory(previous, cards) {
-  const points = previous?.points || {};
+function updateHistory(prev, cards) {
+  const points = prev?.points || {};
   const cutoff = daysAgo(HISTORY_DAYS);
   for (const card of cards) {
     for (const variant of card.variants) {
@@ -320,70 +433,113 @@ function updateHistory(previous, cards) {
   return { updatedAt: today, points };
 }
 
-// ---------- Main ----------
+// ---------- Build one game ----------
 
-async function main() {
+function isDueToday(game, expansion) {
+  if (!game.rotation) return true;
+  const released = Date.parse((expansion.release_date || '').replace(/\//g, '-'));
+  if (!Number.isNaN(released) && (Date.now() - released) / 86_400_000 <= game.rotation.recentDays) return true;
+  return hashString(expansion.id) % game.rotation.shards === dayNumber % game.rotation.shards;
+}
+
+async function buildGame(game) {
   const started = Date.now();
-  console.log('Loading Cardmarket price guide…');
-  const cm = await loadCardmarket();
-  console.log(`  ${cm.prices.size} price rows, ${cm.byExpansion.size} expansions (guide ${cm.createdAt})`);
+  const dir = join(OUT, 'v1', game.id);
+  await mkdir(join(dir, 'sets'), { recursive: true });
+  await mkdir(join(dir, 'history'), { recursive: true });
 
-  console.log('Loading Scrydex expansions…');
-  let expansions = await loadExpansions();
+  console.log(`\n== ${game.name} ==`);
+  const cm = await loadCardmarket(game.cardmarketGame);
+  console.log(`  Cardmarket: ${cm.prices.size} price rows, ${cm.byExpansion.size} expansions (guide ${cm.createdAt})`);
+  const client = scrydexClient(game);
+  let expansions = await client.expansions();
   if (ONLY_SETS.length) expansions = expansions.filter((e) => ONLY_SETS.includes(e.id));
   console.log(`  ${expansions.length} expansions`);
 
-  await mkdir(join(OUT, 'v1', 'sets'), { recursive: true });
-  await mkdir(join(OUT, 'v1', 'history'), { recursive: true });
-
   const claimed = new Set();
   const search = [];
+  const summaries = [];
+  let refreshed = 0;
+  let carried = 0;
   let matchedCards = 0;
   let totalCards = 0;
-  const setSummaries = [];
 
   // Oldest first so reprint sets claim their own Cardmarket expansion.
   const ordered = [...expansions].sort((a, b) => (a.release_date || '').localeCompare(b.release_date || ''));
   await mapLimit(ordered, 3, async (expansion) => {
-    const raw = await loadCards(expansion.id);
-    const cards = raw.map(compactCard).sort((a, b) => naturalNumber(a.number, b.number));
-    const { expansionId, matches } = matchExpansion(cards, cm, claimed);
-    if (expansionId) claimed.add(expansionId);
-    for (const card of cards) attachCardmarket(card, matches.get(card.id));
-
-    const history = updateHistory(await previousHistory(expansion.id), cards);
     const set = {
       id: expansion.id,
       name: expansion.name,
-      series: expansion.series,
-      code: expansion.code,
-      total: expansion.total,
-      printedTotal: expansion.printed_total,
-      releaseDate: expansion.release_date,
-      logo: expansion.logo,
-      symbol: expansion.symbol,
-      cardmarketExpansionId: expansionId,
+      series: expansion.series ?? expansion.block ?? expansion.type ?? null,
+      code: expansion.code ?? null,
+      total: expansion.total ?? null,
+      printedTotal: expansion.printed_total ?? null,
+      releaseDate: expansion.release_date ?? null,
+      logo: expansion.logo ?? null,
+      symbol: expansion.symbol ?? null,
     };
-    await writeFile(join(OUT, 'v1', 'sets', `${expansion.id}.json`), JSON.stringify({ updatedAt: today, set, cards }));
-    await writeFile(join(OUT, 'v1', 'history', `${expansion.id}.json`), JSON.stringify(history));
 
-    const value = cards.reduce((sum, c) => sum + (primaryUsd(c) || 0), 0);
-    setSummaries.push({ ...set, cardCount: cards.length, setValueUsd: round(value) });
+    let file = null;
+    if (!isDueToday(game, expansion)) {
+      file = await previous(`v1/${game.id}/sets/${encodeURIComponent(expansion.id)}.json`);
+      if (file) {
+        carried++;
+        const history = await previous(`v1/${game.id}/history/${encodeURIComponent(expansion.id)}.json`);
+        if (history) await writeFile(join(dir, 'history', `${expansion.id}.json`), JSON.stringify(history));
+      }
+    }
+    if (!file) {
+      const cards = (await client.cards(expansion.id)).map(compactCard).sort((a, b) => naturalNumber(a.number, b.number));
+      let expansionId = null;
+      if (game.matchByCode) {
+        expansionId = attachByCode(cards, cm);
+      } else {
+        const result = matchExpansion(cards, cm, claimed, game);
+        expansionId = result.expansionId;
+        if (expansionId) claimed.add(expansionId);
+        for (const card of cards) attachCardmarket(card, result.matches.get(card.id), game);
+      }
+      const history = updateHistory(await previous(`v1/${game.id}/history/${encodeURIComponent(expansion.id)}.json`), cards);
+      await writeFile(join(dir, 'history', `${expansion.id}.json`), JSON.stringify(history));
+      file = { updatedAt: today, set: { ...set, cardmarketExpansionId: expansionId }, cards };
+      refreshed++;
+    }
+    await writeFile(join(dir, 'sets', `${expansion.id}.json`), JSON.stringify(file));
+
+    const cards = file.cards;
+    const value = cards.reduce((sum, c) => sum + (primaryUsd(c, game) || 0), 0);
+    summaries.push({ ...set, cardCount: cards.length, setValueUsd: round(value), updatedAt: file.updatedAt });
     for (const c of cards) search.push([c.id, c.name, c.number, expansion.id, c.rarity, c.imageSmall]);
     totalCards += cards.length;
-    matchedCards += matches.size;
-    console.log(`  ${expansion.id.padEnd(10)} ${String(cards.length).padStart(4)} cards, ${String(matches.size).padStart(4)} on Cardmarket (#${expansionId ?? '—'})`);
+    matchedCards += cards.filter((c) => c.cardmarketId).length;
   });
 
-  setSummaries.sort((a, b) => (b.releaseDate || '').localeCompare(a.releaseDate || ''));
-  await writeFile(join(OUT, 'v1', 'sets.json'), JSON.stringify({ updatedAt: today, sets: setSummaries }));
-  await writeFile(join(OUT, 'v1', 'search.json'), JSON.stringify({ updatedAt: today, cards: search }));
+  summaries.sort((a, b) => (b.releaseDate || '').localeCompare(a.releaseDate || ''));
+  await writeFile(join(dir, 'sets.json'), JSON.stringify({ updatedAt: today, sets: summaries }));
+  await writeFile(join(dir, 'search.json'), JSON.stringify({ updatedAt: today, cards: search }));
+  const info = {
+    id: game.id, name: game.name, sets: summaries.length, cards: totalCards,
+    cardsWithCardmarket: matchedCards, refreshedSets: refreshed, carriedSets: carried,
+    cardmarketGuideCreatedAt: cm.createdAt, seconds: Math.round((Date.now() - started) / 1000),
+  };
+  console.log(' ', info);
+  return info;
+}
+
+// ---------- Main ----------
+
+async function main() {
+  const started = Date.now();
+  const rate = await usdToEur();
+  const games = [];
+  for (const game of GAMES) {
+    if (ONLY_GAMES.length && !ONLY_GAMES.includes(game.id)) continue;
+    games.push(await buildGame(game));
+  }
   const meta = {
     updatedAt: new Date().toISOString(),
-    cardmarketGuideCreatedAt: cm.createdAt,
-    sets: setSummaries.length,
-    cards: totalCards,
-    cardsWithCardmarket: matchedCards,
+    usdToEur: rate,
+    games,
     scrydexCredits: creditsUsed,
     seconds: Math.round((Date.now() - started) / 1000),
   };
