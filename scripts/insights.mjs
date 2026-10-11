@@ -74,7 +74,8 @@ function isSpike(x) {
 function momentum(x) {
   const d7 = x.d7 ?? 0;
   const d30 = x.d30 ?? 0;
-  let score = clamp(d7 * 2.2 + d30 * 0.8, -100, 100);
+  // tanh keeps the scale readable: only exceptional, broad moves get close to ±100.
+  let score = 100 * Math.tanh((d7 * 1.5 + d30 * 0.5) / 80);
   const e = x.eur;
   if (e?.avg7 && e?.avg30) {
     const cross = (e.avg7 / e.avg30 - 1) * 100; // short average vs long average
@@ -174,7 +175,7 @@ function templateArticles(data, today) {
       ...Object.entries(data.sentiment.byGame).map(([, g]) => `- **${g.name}**: ${g.score}/100 (${g.label}), average ${pct(g.avgChange7d)}`),
       '',
       'Sentiment combines the value-weighted weekly change with market breadth — how many cards go up versus down.',
-    ].join('\n'), data.gainers.slice(0, 3), ['sentiment'], s.score >= 50 ? 'bullish' : 'bearish');
+    ].join('\n'), data.gainers.slice(0, 3), ['sentiment'], s.score >= 58 ? 'bullish' : s.score <= 42 ? 'bearish' : 'neutral');
 
   for (const [gameId, g] of Object.entries(data.sentiment.byGame).slice(0, 3)) {
     const top = data.gainersAll.filter((x) => x.game === gameId).slice(0, 5);
