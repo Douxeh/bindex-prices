@@ -75,11 +75,11 @@ function momentum(x) {
   const d7 = x.d7 ?? 0;
   const d30 = x.d30 ?? 0;
   // tanh keeps the scale readable: only exceptional, broad moves get close to ±100.
-  let score = 100 * Math.tanh((d7 * 1.5 + d30 * 0.5) / 80);
+  let score = 100 * Math.tanh((d7 * 1.5 + d30 * 0.5) / 200);
   const e = x.eur;
   if (e?.avg7 && e?.avg30) {
     const cross = (e.avg7 / e.avg30 - 1) * 100; // short average vs long average
-    if (Math.sign(cross) === Math.sign(score) && Math.abs(cross) > 3) score = clamp(score * 1.15, -100, 100);
+    if (Math.sign(cross) === Math.sign(score) && Math.abs(cross) > 3) score = clamp(score + Math.sign(score) * 5, -99, 99);
     if (Math.sign(cross) === -Math.sign(score) && Math.abs(cross) > 3) score *= 0.7;
   }
   return Math.round(score);
