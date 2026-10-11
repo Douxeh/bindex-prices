@@ -67,7 +67,8 @@ const GAMES = [
     id: 'lorcana', name: 'Disney Lorcana', scrydex: 'lorcana', cardmarketGame: 19,
     standardVariants: ['normal'],
     secondVariant: 'foil', secondSuffix: '-foil',
-    includeExpansion: () => true,
+    expansionQuery: '', // the language filter isn't supported for Lorcana
+    includeExpansion: (e) => !e.language_code || e.language_code === 'EN',
   },
   {
     id: 'gundam', name: 'Gundam', scrydex: 'gundam', cardmarketGame: 24,
