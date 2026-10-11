@@ -83,11 +83,25 @@ const GAMES = [
     includeExpansion: () => true,
     sealed: true,
   },
+  {
+    // Not on Scrydex: cards, images, USD prices and sealed products come from
+    // TCGplayer (via tcgcsv.com), EUR prices from the Cardmarket price guide.
+    id: 'dragonball', name: 'Dragon Ball Super', source: 'tcgcsv', cardmarketGame: 13,
+    tcgplayerCategories: [
+      { id: 80, prefix: 'fw', series: 'Fusion World' },
+      { id: 27, prefix: 'masters', series: 'Masters' },
+    ],
+    standardVariants: ['normal', 'foil'],
+    secondVariant: null, secondSuffix: null,
+    includeExpansion: () => true,
+    sealed: true,
+  },
 ];
 
 const key = process.env.SCRYDEX_API_KEY;
 const team = process.env.SCRYDEX_TEAM_ID;
-if (!key || !team) {
+const needsScrydex = GAMES.some((g) => g.source !== 'tcgcsv' && (!ONLY_GAMES.length || ONLY_GAMES.includes(g.id)));
+if (needsScrydex && (!key || !team)) {
   console.error('Missing SCRYDEX_API_KEY / SCRYDEX_TEAM_ID');
   process.exit(1);
 }
@@ -199,6 +213,174 @@ function scrydexClient(game) {
   };
 }
 
+// ---------- TCGplayer via tcgcsv.com (games Scrydex doesn't cover) ----------
+
+const extended = (product, name) => product.extendedData?.find((e) => e.name === name)?.value ?? null;
+
+function tcgcsvClient(game) {
+  const base = 'https://tcgcsv.com/tcgplayer';
+  const headers = { 'User-Agent': 'bindex-prices/1.0 (+https://github.com/Douxeh/bindex-prices)' };
+  const groups = new Map();
+  const groupData = new Map();
+  const load = async (setId) => {
+    if (!groupData.has(setId)) {
+      const g = groups.get(setId);
+      groupData.set(setId, Promise.all([
+        fetchJSON(`${base}/${g.categoryId}/${g.groupId}/products`, { headers }),
+        fetchJSON(`${base}/${g.categoryId}/${g.groupId}/prices`, { headers }),
+      ]).then(([products, prices]) => ({ products: products.results || [], prices: prices.results || [] })));
+    }
+    return groupData.get(setId);
+  };
+  return {
+    async expansions() {
+      const all = [];
+      for (const category of game.tcgplayerCategories) {
+        const body = await fetchJSON(`${base}/${category.id}/groups`, { headers });
+        for (const g of body.results || []) {
+          const id = `${category.prefix}-${String(g.abbreviation || g.groupId).toLowerCase().replace(/[^a-z0-9]+/g, '')}`;
+          if (groups.has(id)) continue;
+          groups.set(id, { ...g, categoryId: category.id });
+          all.push({ id, name: g.name, series: category.series, code: g.abbreviation ?? null, release_date: g.publishedOn?.slice(0, 10) ?? null });
+        }
+      }
+      return all;
+    },
+    async compactCards(setId) {
+      const { products, prices } = await load(setId);
+      const byProduct = new Map();
+      for (const p of prices) {
+        if (!byProduct.has(p.productId)) byProduct.set(p.productId, []);
+        byProduct.get(p.productId).push(p);
+      }
+      return products.filter((p) => extended(p, 'Number')).map((p) => {
+        const number = extended(p, 'Number');
+        const variants = (byProduct.get(p.productId) || [])
+          .map((row) => ({
+            name: /foil/i.test(row.subTypeName) ? 'foil' : 'normal',
+            usd: (row.marketPrice ?? row.midPrice) != null ? { market: round(row.marketPrice ?? row.midPrice), low: round(row.lowPrice), change: {}, past: {} } : null,
+            conditions: {}, graded: [], tcgplayerId: String(p.productId),
+          }))
+          .sort((a, b) => (a.name === 'normal' ? -1 : 1) - (b.name === 'normal' ? -1 : 1));
+        return {
+          id: `dbs-${p.productId}`,
+          name: p.name.replace(` - ${number}`, '').trim(),
+          number,
+          printedNumber: null,
+          rarity: extended(p, 'Rarity'),
+          supertype: extended(p, 'CardType'),
+          imageSmall: p.imageUrl ?? null,
+          imageLarge: p.imageUrl?.replace('_200w', '_in_1000x1000') ?? null,
+          variants: variants.length ? variants : [{ name: 'normal', usd: null, conditions: {}, graded: [], tcgplayerId: String(p.productId) }],
+        };
+      });
+    },
+    /** Sealed products in the same shape Scrydex returns them. */
+    async sealed() {
+      const out = [];
+      await mapLimit([...groups.keys()], 4, async (setId) => {
+        const g = groups.get(setId);
+        const { products, prices } = await load(setId);
+        for (const p of products) {
+          if (extended(p, 'Number')) continue;
+          const row = prices.find((r) => r.productId === p.productId);
+          const usd = row?.marketPrice ?? row?.midPrice;
+          if (usd == null || /code card/i.test(p.name)) continue;
+          out.push({
+            id: `dbs-${p.productId}`, name: p.name, release_date: g.publishedOn?.slice(0, 10) ?? null,
+            expansion: { id: setId, name: g.name },
+            variants: [{
+              name: 'normal',
+              images: [{ type: 'front', small: p.imageUrl, large: p.imageUrl?.replace('_200w', '_in_1000x1000') }],
+              prices: [{ type: 'raw', currency: 'USD', market: usd }],
+              marketplaces: [{ name: 'tcgplayer', product_id: String(p.productId) }],
+            }],
+          });
+        }
+      });
+      return out;
+    },
+  };
+}
+
+/**
+ * Dragon Ball Super on Cardmarket: Fusion World singles carry their code
+ * ("Son Goku (FB04-129) [Fusion World]"), Masters singles only a name.
+ * Prints of one code (regular, alt art…) are paired by price rank.
+ */
+function attachDragonBall(cards, cm, claimed, game) {
+  const byNumber = new Map();
+  for (const card of cards) {
+    if (!byNumber.has(card.number)) byNumber.set(card.number, []);
+    byNumber.get(card.number).push(card);
+  }
+  const usdOf = (card) => card.variants.find((v) => v.usd?.market != null)?.usd.market ?? 0;
+  // Foil prints (SR, alt arts…) are priced in Cardmarket's foil columns.
+  const trendOf = (product) => { const g = cm.prices.get(product.idProduct) || {}; return g.trend || g['trend-foil'] || 0; };
+  // Sort key that still ranks prints without a recent trend.
+  const rankOf = (product) => {
+    const g = cm.prices.get(product.idProduct) || {};
+    return g.trend || g['trend-foil'] || g.avg30 || g['avg30-foil'] || g.avg || g['avg-foil'] || g.low || 0;
+  };
+  const setEur = (card, product) => {
+    card.cardmarketId = product.idProduct;
+    const target = card.variants[0];
+    if (!target) return;
+    const g = cm.prices.get(product.idProduct);
+    const [first, second] = target.name === 'foil' ? ['-foil', ''] : ['', '-foil'];
+    const pick = (suffix) => { const v = eurFrom(g, suffix); return v?.trend ? v : null; };
+    target.eur = pick(first) || pick(second) || eurFrom(g, first);
+    // A wildly different price means the prints were paired wrongly: leave EUR out.
+    const usd = target.usd?.market;
+    if (usd >= 1 && target.eur?.trend && (target.eur.trend / usd < 0.25 || target.eur.trend / usd > 4)) {
+      target.eur = null;
+      delete card.cardmarketId;
+    }
+  };
+
+  // Fusion World: the same code sits in several Cardmarket expansions
+  // (English, Japanese, reprints) — take the one whose prices track the US market.
+  const counts = new Map();
+  for (const number of byNumber.keys()) {
+    for (const id of new Set((cm.byLooseCode.get(number) || []).map((p) => p.idExpansion))) counts.set(id, (counts.get(id) || 0) + 1);
+  }
+  const median = (xs) => { const v = [...xs].sort((x, y) => x - y); return v.length ? v[Math.floor(v.length / 2)] : Infinity; };
+  let best = null;
+  for (const [expansionId, hits] of [...counts.entries()].sort((x, y) => y[1] - x[1]).slice(0, 5)) {
+    const coverage = hits / byNumber.size;
+    if (coverage < 0.5) continue;
+    const errors = [];
+    for (const [number, group] of byNumber) {
+      const usd = Math.min(...group.map(usdOf).filter((u) => u > 0));
+      const trends = (cm.byLooseCode.get(number) || []).filter((p) => p.idExpansion === expansionId).map(trendOf).filter((t) => t > 0);
+      if (usd >= 0.25 && usd < Infinity && trends.length) errors.push(Math.abs(Math.log(Math.min(...trends) / usd)));
+    }
+    const score = median(errors) - coverage;
+    if (errors.length >= 3 && (!best || score < best.score)) best = { expansionId, score };
+  }
+  if (best) {
+    for (const [number, group] of byNumber) {
+      const products = (cm.byLooseCode.get(number) || [])
+        .filter((p) => p.idExpansion === best.expansionId)
+        .sort((x, y) => rankOf(x) - rankOf(y));
+      if (!products.length) continue;
+      const ordered = [...group].sort((x, y) => usdOf(x) - usdOf(y));
+      if (ordered.length === products.length) ordered.forEach((card, i) => setEur(card, products[i]));
+      else setEur(ordered[0], products.find((p) => trendOf(p) > 0) || products[0]);
+    }
+    return best.expansionId;
+  }
+
+  // Masters: match on the card name within the most alike expansion.
+  const result = matchExpansion(cards, cm, claimed, game);
+  if (result.expansionId) claimed.add(result.expansionId);
+  for (const card of cards) {
+    const match = result.matches.get(card.id);
+    if (match?.guide) setEur(card, { idProduct: match.idProduct });
+  }
+  return result.expansionId;
+}
+
 function compactVariant(variant) {
   const prices = variant.prices || [];
   const nm = prices.find((p) => p.type === 'raw' && p.condition === 'NM' && p.currency === 'USD');
@@ -246,6 +428,7 @@ function compactCard(card) {
 // ---------- Cardmarket ----------
 
 const normalizeName = (name) => name
+  .replace(/&#39;|&apos;/g, "'").replace(/&amp;/g, '&')
   .replace(/\[.*?\]/g, ' ')
   .replace(/\(.*?\)/g, ' ')
   .split(' // ')[0]
@@ -289,13 +472,21 @@ async function loadCardmarket(gameId) {
     if (!byCode.has(code)) byCode.set(code, []);
     byCode.get(code).push(product);
   }
-  return { createdAt: guide.createdAt, prices, byExpansion, expansionsByName, byCode };
+  // Like byCode, but also for names with a suffix ("Name (FB01-001) [Fusion World]").
+  const byLooseCode = new Map();
+  for (const product of products.products) {
+    const code = product.name.match(/\(([A-Z0-9]+-[A-Z0-9]+)\)/)?.[1];
+    if (!code) continue;
+    if (!byLooseCode.has(code)) byLooseCode.set(code, []);
+    byLooseCode.get(code).push(product);
+  }
+  return { createdAt: guide.createdAt, prices, byExpansion, expansionsByName, byCode, byLooseCode };
 }
 
 const eurFrom = (g, suffix = '') => {
   if (!g) return null;
   const v = {
-    trend: round(g[`trend${suffix}`]), avg: round(g[`avg${suffix}`]), low: round(g[`low${suffix}`]),
+    trend: round(g[`trend${suffix}`]) || null, // 0 means "no sales", not free avg: round(g[`avg${suffix}`]), low: round(g[`low${suffix}`]),
     avg1: round(g[`avg1${suffix}`]), avg7: round(g[`avg7${suffix}`]), avg30: round(g[`avg30${suffix}`]),
   };
   return Object.values(v).some((x) => x != null) ? v : null;
@@ -554,7 +745,7 @@ async function buildGame(game) {
   console.log(`\n== ${game.name} ==`);
   const cm = await loadCardmarket(game.cardmarketGame);
   console.log(`  Cardmarket: ${cm.prices.size} price rows, ${cm.byExpansion.size} expansions (guide ${cm.createdAt})`);
-  const client = scrydexClient(game);
+  const client = game.source === 'tcgcsv' ? tcgcsvClient(game) : scrydexClient(game);
   let expansions = await client.expansions();
   if (ONLY_SETS.length) expansions = expansions.filter((e) => ONLY_SETS.includes(e.id));
   console.log(`  ${expansions.length} expansions`);
@@ -593,9 +784,12 @@ async function buildGame(game) {
       }
     }
     if (!file) {
-      const cards = (await client.cards(expansion.id)).map(compactCard).sort((a, b) => naturalNumber(a.number, b.number));
+      const cards = (client.compactCards ? await client.compactCards(expansion.id) : (await client.cards(expansion.id)).map(compactCard))
+        .sort((a, b) => naturalNumber(a.number, b.number));
       let expansionId = null;
-      if (game.matchByCode) {
+      if (game.source === 'tcgcsv') {
+        expansionId = attachDragonBall(cards, cm, claimed, game);
+      } else if (game.matchByCode) {
         expansionId = attachByCode(cards, cm);
       } else {
         const result = matchExpansion(cards, cm, claimed, game);
@@ -608,9 +802,11 @@ async function buildGame(game) {
       file = { updatedAt: today, set: { ...set, cardmarketExpansionId: expansionId }, cards };
       refreshed++;
     }
+    const cards = file.cards;
+    if (cards.length === 0) return; // sealed-only groups
+    if (game.source === 'tcgcsv') file.set.total = file.set.printedTotal = cards.length;
     await writeFile(join(dir, 'sets', `${expansion.id}.json`), JSON.stringify(file));
 
-    const cards = file.cards;
     const value = cards.reduce((sum, c) => sum + (primaryUsd(c, game) || 0), 0);
     summaries.push({ ...set, cardCount: cards.length, setValueUsd: round(value), updatedAt: file.updatedAt });
     for (const c of cards) search.push([c.id, c.name, c.number, expansion.id, c.rarity, c.imageSmall]);
