@@ -87,6 +87,7 @@ const GAMES = [
     // Not on Scrydex: cards, images, USD prices and sealed products come from
     // TCGplayer (via tcgcsv.com), EUR prices from the Cardmarket price guide.
     id: 'dragonball', name: 'Dragon Ball Super', source: 'tcgcsv', cardmarketGame: 13,
+    disabled: true, // parked: no price trends/history yet
     tcgplayerCategories: [
       { id: 80, prefix: 'fw', series: 'Fusion World' },
       { id: 27, prefix: 'masters', series: 'Masters' },
@@ -844,6 +845,7 @@ async function main() {
   const games = [];
   for (const game of GAMES) {
     if (ONLY_GAMES.length && !ONLY_GAMES.includes(game.id)) continue;
+    if (game.disabled && !ONLY_GAMES.includes(game.id)) continue;
     games.push(await buildGame(game));
   }
   const meta = {
