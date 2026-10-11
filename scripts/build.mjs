@@ -200,7 +200,9 @@ function compactCard(card) {
   return {
     id: card.id,
     name: card.name,
-    number: card.number,
+    // Some cards (One Piece DON!!, a few promos) have no number; fall back
+    // to the printed number or the id suffix so every card is addressable.
+    number: card.number ?? card.printed_number ?? String(card.id).split('-').pop(),
     printedNumber: card.printed_number ?? null,
     rarity: card.rarity ?? null,
     supertype: card.supertype ?? card.type ?? null,
