@@ -642,7 +642,8 @@ function updateHistory(prev, cards) {
         for (const [d, value] of Object.entries(variant.usd?.past || {})) {
           seed.set(daysAgo(Number(d.slice(1))), [value, null]);
         }
-        const cmPast = { 30: variant.eur?.avg30, 7: variant.eur?.avg7, 1: variant.eur?.avg1 };
+        // avg1 is left out: one day's sales are too noisy (a single stray sale shows as a spike).
+        const cmPast = { 30: variant.eur?.avg30, 7: variant.eur?.avg7 };
         for (const [d, value] of Object.entries(cmPast)) {
           if (value == null) continue;
           const date = daysAgo(Number(d));
